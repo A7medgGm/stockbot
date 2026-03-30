@@ -10,219 +10,123 @@ from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ── إعدادات ──────────────────────────────────────────────
+# ── الإعدادات ──────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SHEET_ID  = os.environ.get("SHEET_ID")
 API_URL   = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── اتصال بـ Google Sheets ────────────────────────────────
+# ── الاتصال بـ Google Sheets ────────────────────────────────
 def get_sheets():
     try:
         creds_json = os.environ.get("GOOGLE_CREDS_JSON")
-        if not creds_json:
-            logger.error("❌ GOOGLE_CREDS_JSON is missing!")
-            return None, None
-            
         creds_dict = json.loads(creds_json, strict=False)
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         client = gspread.authorize(creds)
         spreadsheet = client.open_by_key(SHEET_ID)
-
-        titles = [ws.title for ws in spreadsheet.worksheets()]
-        if "Inventory" not in titles:
-            ws = spreadsheet.add_worksheet(title="Inventory", rows=100, cols=3)
-            ws.append_row(["المنتج", "الكمية", "السعر"])
-        if "Sales" not in titles:
-            ws = spreadsheet.add_worksheet(title="Sales", rows=1000, cols=4)
-            ws.append_row(["التاريخ", "العميل", "المنتج", "الكمية"])
-
-        inv   = spreadsheet.worksheet("Inventory")
-        sales = spreadsheet.worksheet("Sales")
-        return inv, sales
+        return spreadsheet.worksheet("Inventory"), spreadsheet.worksheet("Sales"), spreadsheet.worksheet("Expenses")
     except Exception as e:
-        logger.error(f"❌ Error in get_sheets: {e}")
-        return None, None
+        logger.error(f"❌ Sheets Error: {e}")
+        return None, None, None
 
-# ── إرسال رسالة ──────────────────────────────────────────
 def send_message(chat_id, text):
-    try:
-        requests.post(f"{API_URL}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown"
-        }, timeout=10)
-    except Exception as e:
-        logger.error(f"❌ Error sending message: {e}")
+    requests.post(f"{API_URL}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
 
-# ── جيب كل المنتجات ──────────────────────────────────────
-def get_inventory(inv_ws):
-    try:
-        records = inv_ws.get_all_values()
-        result = {}
-        for row in records[1:]:
-            if len(row) >= 2 and row[0].strip():
-                try:
-                    qty = int(row[1])
-                except:
-                    qty = 0
-                result[row[0].strip()] = {
-                    "qty": qty,
-                    "price": row[2] if len(row) > 2 else ""
-                }
-        return result
-    except:
-        return {}
-
-# ── دور على منتج ─────────────────────────────────────────
-def find_product(inventory, query):
-    query = query.strip().lower()
-    for name in inventory:
-        if query in name.lower() or name.lower() in query:
-            return name
-    return None
-
-# ── معالجة الرسائل ───────────────────────────────────────
+# ── المعالجة الاحترافية ──────────────────────────────────────
 def handle_message(chat_id, text):
     text = text.strip()
-    logger.info(f"📥 Received: {text}")
+    inv_ws, sales_ws, exp_ws = get_sheets()
+    if not inv_ws: return
 
-    # --- اختبار فوري للاتصال ---
-    # لو شفت الرسالة دي على تليجرام يبقى البوت شغال والتوكن صح
-    if text.lower() == "تست" or text == "test":
-        send_message(chat_id, "✅ البوت شغال ومستني أوامرك!")
-        return
-
-    # محاولة الاتصال بجوجل شيت
-    inv_ws, sales_ws = get_sheets()
-    if not inv_ws:
-        send_message(chat_id, "❌ مشكلة في الوصول لجوجل شيت. اتأكد من الصلاحيات والـ JSON.")
-        return
-        
-    inventory = get_inventory(inv_ws)
-
-    # 1. استعلام: باقي كم
-    if re.search(r"باقي كم|كم باقي|كم في المخزن", text):
-        query = re.sub(r"باقي كم|كم باقي|كم في المخزن|في المخزن|من", "", text).strip()
-        if not query:
-            if not inventory:
-                send_message(chat_id, "المخزن فاضي!")
+    # 1. البيع (يدعم السعر الخاص)
+    m_sale = re.search(r"(.+?)\s+(شال|باع|اخد|طلب)\s+(\d+)\s+(.+?)(?:\s+(\d+))?$", text)
+    if m_sale:
+        customer, qty, p_query, custom_p = m_sale.group(1), int(m_sale.group(3)), m_sale.group(4).strip(), m_sale.group(5)
+        data = inv_ws.get_all_values()
+        for i, row in enumerate(data[1:], 2):
+            if p_query.lower() in row[0].lower():
+                curr_qty = int(row[1])
+                sell_p = float(custom_p) if custom_p else (float(row[2]) if row[2] else 0)
+                cost_p = float(row[3]) if row[3] else 0
+                profit = (sell_p - cost_p) * qty
+                inv_ws.update_cell(i, 2, curr_qty - qty)
+                sales_ws.append_row([datetime.now().strftime("%Y-%m-%d"), customer, row[0], qty, sell_p * qty, profit])
+                send_message(chat_id, f"💰 *تم البيع*\n📦 {row[0]}\n💵 الإجمالي: {sell_p * qty}\n✨ الربح: {profit}\n📉 المتبقي: {curr_qty - qty}")
                 return
-            msg = "📊 *المخزن الحالي:*\n\n"
-            for name, data in inventory.items():
-                msg += f"- {name}: `{data['qty']}` قطعة\n"
-            send_message(chat_id, msg)
-            return
-        
-        product = find_product(inventory, query)
-        if product:
-            send_message(chat_id, f"📦 *{product}*\nالمتبقي: `{inventory[product]['qty']}` قطعة")
-        else:
-            send_message(chat_id, f"🔍 مش لاقي منتج بالاسم ده: '{query}'")
-        return
 
-    # 2. إضافة مخزون (اضافة 5 بطارية)
-    m = re.search(r"(اضافة|أضف|وصل|استلمت)\s+(\d+)\s+(.+)", text)
-    if m:
-        qty_add = int(m.group(2))
-        query   = m.group(3).strip()
-        product = find_product(inventory, query)
-        if product:
-            all_rows = inv_ws.get_all_values()
-            for i, row in enumerate(all_rows):
-                if row[0].strip() == product:
-                    new_qty = inventory[product]["qty"] + qty_add
-                    inv_ws.update_cell(i + 1, 2, new_qty)
-                    send_message(chat_id, f"✅ تم إضافة {qty_add} لـ {product}\nالرصيد الحالي: `{new_qty}`")
-                    return
-        else:
-            inv_ws.append_row([query, qty_add, ""])
-            send_message(chat_id, f"🆕 منتج جديد: *{query}* بكمية `{qty_add}`")
-        return
+    # 2. المرتجع (يرجع البضاعة ويخصم الأرباح)
+    m_ret = re.search(r"مرتجع\s+(\d+)\s+(.+?)\s+(.+)", text)
+    if m_ret:
+        qty_ret, p_query, customer = int(m_ret.group(1)), m_ret.group(2).strip(), m_ret.group(3).strip()
+        data = inv_ws.get_all_values()
+        for i, row in enumerate(data[1:], 2):
+            if p_query.lower() in row[0].lower():
+                # إرجاع للمخزن
+                inv_ws.update_cell(i, 2, int(row[1]) + qty_ret)
+                # تسجيل في المبيعات بقيمة سالبة لخصمها من التقرير
+                sell_p = float(row[2]) if row[2] else 0
+                cost_p = float(row[3]) if row[3] else 0
+                loss_to_deduct = (sell_p - cost_p) * qty_ret
+                sales_ws.append_row([datetime.now().strftime("%Y-%m-%d"), f"مرتجع: {customer}", row[0], -qty_ret, -(sell_p * qty_ret), -loss_to_deduct])
+                send_message(chat_id, f"↩️ *تم تسجيل مرتجع*\n📦 {row[0]}\n📥 دخل المخزن: {qty_ret}\n💸 خصم مبيعات: {sell_p * qty_ret}")
+                return
 
-    # 3. تسجيل بيع (احمد شال 2 بطارية)
-    m = re.search(r"(.+?)\s+(شال|اخد|اشترى|أخد|باع|طلب)\s+(\d+)\s+(.+)", text)
-    if m:
-        customer = m.group(1).strip()
-        qty_sell = int(m.group(3))
-        query    = m.group(4).strip()
-        product  = find_product(inventory, query)
-        
-        if not product:
-            send_message(chat_id, f"❓ المنتج '{query}' مش موجود في المخزن.")
-            return
-        
-        current_qty = inventory[product]["qty"]
-        if current_qty < qty_sell:
-            send_message(chat_id, f"⚠️ الكمية مش كفاية! المتاح `{current_qty}` بس.")
-            return
-            
-        all_rows = inv_ws.get_all_values()
-        for i, row in enumerate(all_rows):
-            if row[0].strip() == product:
-                new_qty = current_qty - qty_sell
-                inv_ws.update_cell(i + 1, 2, new_qty)
-                break
-                
-        date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        sales_ws.append_row([date_str, customer, product, qty_sell])
-        send_message(chat_id, f"💰 *عملية بيع*\n👤 العميل: {customer}\n📦 المنتج: {product}\n📉 الكمية: {qty_sell}\n✅ المتبقي: `{new_qty}`")
-        return
+    # 3. تعديل السعر الرسمي
+    m_mod = re.search(r"تعديل\s+(.+?)\s+(\d+)(?:\s+(\d+))?$", text)
+    if m_mod:
+        p_query, s_p, c_p = m_mod.group(1).strip(), m_mod.group(2), m_mod.group(3)
+        data = inv_ws.get_all_values()
+        for i, row in enumerate(data[1:], 2):
+            if p_query.lower() in row[0].lower():
+                inv_ws.update_cell(i, 3, s_p)
+                if c_p: inv_ws.update_cell(i, 4, c_p)
+                send_message(chat_id, f"✅ تم تعديل أسعار *{row[0]}*")
+                return
 
-    # رسالة المساعدة
-    send_message(chat_id, "🤖 *أوامر البوت:*\n- باقي كم (اسم المنتج)\n- اضافة 10 (اسم المنتج)\n- محمد شال 2 (اسم المنتج)")
+    # 4. إضافة كمية
+    m_add = re.search(r"اضافة\s+(\d+)\s+(.+)$", text)
+    if m_add:
+        qty, p_query = int(m_add.group(1)), m_add.group(2).strip()
+        data = inv_ws.get_all_values()
+        for i, row in enumerate(data[1:], 2):
+            if p_query.lower() in row[0].lower():
+                inv_ws.update_cell(i, 2, int(row[1]) + qty)
+                send_message(chat_id, f"✅ زاد المخزن {qty} لـ {row[0]}")
+                return
 
-# ── HTTP Server (ضروري لـ Render) ─────────────────────────
+    # 5. التقارير والجرد والمصاريف
+    if text == "تقرير":
+        today = datetime.now().strftime("%Y-%m-%d")
+        s_data, e_data = sales_ws.get_all_values(), exp_ws.get_all_values()
+        t_s = sum(float(r[4]) for r in s_data[1:] if r[0] == today)
+        t_p = sum(float(r[5]) for r in s_data[1:] if r[0] == today)
+        t_e = sum(float(r[2]) for r in e_data[1:] if r[0] == today)
+        send_message(chat_id, f"📊 *تقرير اليوم*\n💰 مبيعات: {t_s}\n💸 مصاريف: {t_e}\n📈 صافي ربح: {t_p - t_e}")
+    
+    if "باقي كم" in text:
+        data = inv_ws.get_all_values()
+        msg = "📦 *المخزن:*\n"
+        for r in data[1:]: msg += f"- {r[0]}: `{r[1]}` (سعر: {r[2]})\n"
+        send_message(chat_id, msg)
+
+# ── نظام التشغيل ──────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is online")
-    def log_message(self, format, *args): pass
-
-def run_health_server():
-    # ريندر بيبعت البورت في متغير PORT
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"🚀 Health Server on port {port}")
-    server.serve_forever()
-
-# ── Polling (سحب الرسائل) ─────────────────────────────────
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Live")
 def run_bot():
     offset = None
-    logger.info("📡 Bot Polling started...")
     while True:
         try:
-            # استخدام timeout قصير (10 ثواني) لضمان عدم تعليق السيرفر
-            params = {"timeout": 10, "offset": offset}
-            resp = requests.get(f"{API_URL}/getUpdates", params=params, timeout=15)
-            
+            resp = requests.get(f"{API_URL}/getUpdates", params={"timeout": 10, "offset": offset}, timeout=15)
             if resp.status_code == 200:
-                updates = resp.json().get("result", [])
-                for update in updates:
-                    offset = update["update_id"] + 1
-                    msg = update.get("message", {})
-                    chat_id = msg.get("chat", {}).get("id")
-                    text = msg.get("text", "")
-                    if chat_id and text:
-                        handle_message(chat_id, text)
-            else:
-                logger.error(f"Telegram API Error: {resp.status_code}")
-                time.sleep(5)
-        except Exception as e:
-            logger.error(f"Polling error: {e}")
-            time.sleep(10)
+                for up in resp.json().get("result", []):
+                    offset = up["update_id"] + 1
+                    msg = up.get("message", {})
+                    if msg.get("text"): handle_message(msg["chat"]["id"], msg["text"])
+        except: time.sleep(5)
 
-# ── التشغيل ────────────────────────────────────────────────
 if __name__ == "__main__":
-    # تشغيل سيرفر الـ Health في Thread منفصل
-    threading.Thread(target=run_health_server, daemon=True).start()
-    # تشغيل البوت
+    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), HealthHandler).serve_forever(), daemon=True).start()
     run_bot()
