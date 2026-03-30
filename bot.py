@@ -10,11 +10,10 @@ from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ── إعدادات ──────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SHEET_ID  = os.environ.get("SHEET_ID")
 API_URL   = f"https://api.telegram.org/bot{BOT_TOKEN}"
-LOW_STOCK  = 5
+LOW_STOCK = 5
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -23,8 +22,6 @@ SCOPES = [
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# حالة المحادثات النشطة
 sessions = {}
 
 # ── Google Sheets ─────────────────────────────────────────
@@ -36,8 +33,15 @@ def get_sheets():
     titles = [ws.title for ws in sp.worksheets()]
 
     if "Inventory" not in titles:
-        ws = sp.add_worksheet("Inventory", 100, 3)
-        ws.append_row(["المنتج", "الكمية", "السعر"])
+        ws = sp.add_worksheet("Inventory", 100, 4)
+        ws.append_row(["المنتج", "الكمية", "سعر البيع", "التكلفة"])
+    else:
+        # تأكد إن عمود التكلفة موجود
+        inv = sp.worksheet("Inventory")
+        header = inv.row_values(1)
+        if len(header) < 4:
+            inv.update_cell(1, 4, "التكلفة")
+
     if "Sales" not in titles:
         ws = sp.add_worksheet("Sales", 1000, 5)
         ws.append_row(["ID", "التاريخ", "العميل", "المنتج", "الكمية"])
@@ -56,7 +60,9 @@ def get_inventory(inv_ws):
             except: qty = 0
             try: price = float(re.sub(r"[^\d.]", "", row[2])) if len(row) > 2 and row[2] else 0
             except: price = 0
-            result[row[0].strip()] = {"qty": qty, "price": price}
+            try: cost = float(re.sub(r"[^\d.]", "", row[3])) if len(row) > 3 and row[3] else 0
+            except: cost = 0
+            result[row[0].strip()] = {"qty": qty, "price": price, "cost": cost}
     return result
 
 def get_next_id(ws):
@@ -65,7 +71,13 @@ def get_next_id(ws):
     try: return int(rows[-1][0]) + 1
     except: return len(rows)
 
-# ── Telegram API ──────────────────────────────────────────
+def find_product(inventory, query):
+    query = query.strip().lower()
+    for name in inventory:
+        if query in name.lower() or name.lower() in query:
+            return name
+    return None
+
 def send(chat_id, text, keyboard=None):
     data = {"chat_id": chat_id, "text": text}
     if keyboard:
@@ -75,19 +87,12 @@ def send(chat_id, text, keyboard=None):
 def answer_callback(callback_id):
     requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": callback_id})
 
-def find_product(inventory, query):
-    query = query.strip().lower()
-    for name in inventory:
-        if query in name.lower() or name.lower() in query:
-            return name
-    return None
-
 def check_low_stock(chat_id, inventory):
     low = [f"- {n}: {d['qty']} قطعة" for n, d in inventory.items() if d['qty'] <= LOW_STOCK]
     if low:
         send(chat_id, "تحذير: مخزون منخفض!\n\n" + "\n".join(low))
 
-# ── القوائم الرئيسية ──────────────────────────────────────
+# ── القوائم ───────────────────────────────────────────────
 def main_menu(chat_id):
     keyboard = [
         [{"text": "🧾 فاتورة جديدة", "callback_data": "new_invoice"}],
@@ -111,8 +116,7 @@ def inventory_menu(chat_id):
 def reports_menu(chat_id):
     keyboard = [
         [{"text": "📅 تقرير اليوم", "callback_data": "report_today"},
-         {"text": "📅 تقرير الأسبوع", "callback_data": "report_week"}],
-        [{"text": "📅 تقرير الشهر", "callback_data": "report_month"}],
+         {"text": "📅 تقرير الشهر", "callback_data": "report_month"}],
         [{"text": "💰 أرباح اليوم", "callback_data": "profit_today"},
          {"text": "💰 أرباح الشهر", "callback_data": "profit_month"}],
         [{"text": "🏆 أكثر منتج", "callback_data": "top_product"},
@@ -124,15 +128,22 @@ def reports_menu(chat_id):
 def manage_menu(chat_id):
     keyboard = [
         [{"text": "✏️ تعديل سعر", "callback_data": "edit_price"},
-         {"text": "✏️ تعديل اسم", "callback_data": "edit_name"}],
-        [{"text": "🗑️ حذف منتج", "callback_data": "delete_product"}],
+         {"text": "✏️ تعديل تكلفة", "callback_data": "edit_cost"}],
+        [{"text": "✏️ تعديل اسم", "callback_data": "edit_name"},
+         {"text": "🗑️ حذف منتج", "callback_data": "delete_product"}],
         [{"text": "❌ إلغاء بيع", "callback_data": "cancel_sale"},
          {"text": "↩️ مرتجع", "callback_data": "return_sale"}],
         [{"text": "🔙 رجوع", "callback_data": "main_menu"}]
     ]
-    send(chat_id, "إدارة المنتجات:", keyboard)
+    send(chat_id, "إدارة:", keyboard)
 
-def products_keyboard(inventory, callback_prefix="inv"):
+def products_keyboard(chat_id, callback_prefix):
+    # جيب المنتجات fresh في كل مرة
+    try:
+        inv_ws, _, _ = get_sheets()
+        inventory = get_inventory(inv_ws)
+    except:
+        inventory = {}
     buttons = []
     items = list(inventory.keys())
     for i in range(0, len(items), 2):
@@ -142,6 +153,32 @@ def products_keyboard(inventory, callback_prefix="inv"):
         buttons.append(row)
     buttons.append([{"text": "🔙 رجوع", "callback_data": "main_menu"}])
     return buttons
+
+# ── حساب الأرباح ──────────────────────────────────────────
+def calc_profit(inventory, sales_ws, exp_ws, period):
+    all_sales = sales_ws.get_all_values()
+    filtered = [r for r in all_sales[1:] if len(r) >= 5 and (not period or r[1].startswith(period)) and not str(r[4]).startswith("-")]
+
+    revenue = 0
+    cogs = 0
+    for row in filtered:
+        prod = find_product(inventory, row[3])
+        if prod:
+            try:
+                qty = int(row[4])
+                revenue += inventory[prod]["price"] * qty
+                cogs    += inventory[prod]["cost"] * qty
+            except: pass
+
+    all_exp = exp_ws.get_all_values()
+    expenses = sum(
+        float(r[2]) for r in all_exp[1:]
+        if len(r) >= 3 and r[2] and (not period or r[0].startswith(period))
+    )
+
+    gross_profit = revenue - cogs
+    net_profit   = gross_profit - expenses
+    return revenue, cogs, expenses, gross_profit, net_profit, len(filtered)
 
 # ── معالجة الأزرار ────────────────────────────────────────
 def handle_callback(chat_id, data, callback_id):
@@ -154,7 +191,6 @@ def handle_callback(chat_id, data, callback_id):
         send(chat_id, f"خطأ: {e}")
         return
 
-    # القوائم
     if data == "main_menu":
         sessions.pop(chat_id, None)
         main_menu(chat_id)
@@ -175,18 +211,19 @@ def handle_callback(chat_id, data, callback_id):
     # عرض المخزون
     if data == "show_inventory":
         if not inventory:
-            send(chat_id, "المخزن فاضي!")
+            send(chat_id, "المخزن فاضي!", [[{"text": "🔙 رجوع", "callback_data": "menu_inventory"}]])
             return
         msg = "المخزن الحالي:\n\n"
         for name, d in inventory.items():
-            price_str = f" | {d['price']:.0f} درهم" if d['price'] else ""
-            msg += f"- {name}: {d['qty']} قطعة{price_str}\n"
+            price_str = f" | بيع: {d['price']:.0f}" if d['price'] else ""
+            cost_str  = f" | تكلفة: {d['cost']:.0f}" if d['cost'] else ""
+            msg += f"- {name}: {d['qty']} قطعة{price_str}{cost_str}\n"
         send(chat_id, msg, [[{"text": "🔙 رجوع", "callback_data": "menu_inventory"}]])
         return
 
-    # ── فاتورة جديدة ─────────────────────────────────────
+    # فاتورة جديدة
     if data == "new_invoice":
-        sessions[chat_id] = {"step": "invoice_customer"}
+        sessions[chat_id] = {"step": "invoice_customer", "items": []}
         send(chat_id, "اكتب اسم العميل:")
         return
 
@@ -197,11 +234,17 @@ def handle_callback(chat_id, data, callback_id):
         send(chat_id, f"كم قطعة من {product}؟")
         return
 
+    if data == "invoice_add_more":
+        sessions[chat_id]["step"] = "invoice_product"
+        keyboard = products_keyboard(chat_id, "invoice_add")
+        send(chat_id, "اختار منتج:", keyboard)
+        return
+
     if data == "invoice_done":
         sess = sessions.get(chat_id, {})
         items = sess.get("items", [])
         if not items:
-            send(chat_id, "مفيش منتجات في الفاتورة!")
+            send(chat_id, "مفيش منتجات!")
             main_menu(chat_id)
             return
         customer = sess.get("customer", "")
@@ -209,20 +252,18 @@ def handle_callback(chat_id, data, callback_id):
         msg = f"الفاتورة - {customer}\n{'─'*20}\n"
         total = 0
         for item in items:
-            price = inventory.get(item["product"], {}).get("price", 0)
-            subtotal = price * item["qty"]
+            d = inventory.get(item["product"], {})
+            subtotal = d.get("price", 0) * item["qty"]
             total += subtotal
             msg += f"- {item['product']} × {item['qty']}"
             if subtotal: msg += f" = {subtotal:.0f} درهم"
             msg += "\n"
-            # خصم من المخزون
             all_rows = inv_ws.get_all_values()
             for i, row in enumerate(all_rows):
                 if row[0].strip() == item["product"]:
-                    new_qty = inventory[item["product"]]["qty"] - item["qty"]
+                    new_qty = d.get("qty", 0) - item["qty"]
                     inv_ws.update_cell(i + 1, 2, new_qty)
                     break
-            # تسجيل في Sales
             sale_id = get_next_id(sales_ws)
             sales_ws.append_row([sale_id, date_str, customer, item["product"], item["qty"]])
         if total:
@@ -233,17 +274,10 @@ def handle_callback(chat_id, data, callback_id):
         main_menu(chat_id)
         return
 
-    if data == "invoice_add_more":
-        sess = sessions.get(chat_id, {})
-        sess["step"] = "invoice_product"
-        keyboard = products_keyboard(inventory, "invoice_add")
-        send(chat_id, "اختار منتج:", keyboard)
-        return
-
-    # ── إضافة كمية ───────────────────────────────────────
+    # إضافة كمية
     if data == "add_stock":
         sessions[chat_id] = {"step": "add_stock_product"}
-        keyboard = products_keyboard(inventory, "addstock")
+        keyboard = products_keyboard(chat_id, "addstock")
         send(chat_id, "اختار المنتج:", keyboard)
         return
 
@@ -253,29 +287,42 @@ def handle_callback(chat_id, data, callback_id):
         send(chat_id, f"كم قطعة تضيف لـ {product}؟")
         return
 
-    # ── منتج جديد ─────────────────────────────────────────
+    # منتج جديد
     if data == "new_product":
         sessions[chat_id] = {"step": "new_product_name"}
         send(chat_id, "اكتب اسم المنتج الجديد:")
         return
 
-    # ── تعديل سعر ─────────────────────────────────────────
+    # تعديل سعر
     if data == "edit_price":
         sessions[chat_id] = {"step": "edit_price_product"}
-        keyboard = products_keyboard(inventory, "editprice")
+        keyboard = products_keyboard(chat_id, "editprice")
         send(chat_id, "اختار المنتج:", keyboard)
         return
 
     if data.startswith("editprice:"):
         product = data.split(":", 1)[1]
         sessions[chat_id] = {"step": "edit_price_value", "product": product}
-        send(chat_id, f"اكتب السعر الجديد لـ {product}:")
+        send(chat_id, f"اكتب سعر البيع الجديد لـ {product}:")
         return
 
-    # ── تعديل اسم ─────────────────────────────────────────
+    # تعديل تكلفة
+    if data == "edit_cost":
+        sessions[chat_id] = {"step": "edit_cost_product"}
+        keyboard = products_keyboard(chat_id, "editcost")
+        send(chat_id, "اختار المنتج:", keyboard)
+        return
+
+    if data.startswith("editcost:"):
+        product = data.split(":", 1)[1]
+        sessions[chat_id] = {"step": "edit_cost_value", "product": product}
+        send(chat_id, f"اكتب تكلفة الشراء لـ {product}:")
+        return
+
+    # تعديل اسم
     if data == "edit_name":
         sessions[chat_id] = {"step": "edit_name_product"}
-        keyboard = products_keyboard(inventory, "editname")
+        keyboard = products_keyboard(chat_id, "editname")
         send(chat_id, "اختار المنتج:", keyboard)
         return
 
@@ -285,10 +332,9 @@ def handle_callback(chat_id, data, callback_id):
         send(chat_id, f"اكتب الاسم الجديد لـ {product}:")
         return
 
-    # ── حذف منتج ─────────────────────────────────────────
+    # حذف منتج
     if data == "delete_product":
-        sessions[chat_id] = {"step": "delete_product"}
-        keyboard = products_keyboard(inventory, "deleteprod")
+        keyboard = products_keyboard(chat_id, "deleteprod")
         send(chat_id, "اختار المنتج للحذف:", keyboard)
         return
 
@@ -299,24 +345,23 @@ def handle_callback(chat_id, data, callback_id):
             if row[0].strip() == product:
                 inv_ws.delete_rows(i + 1)
                 break
-        sessions.pop(chat_id, None)
         send(chat_id, f"تم حذف {product}")
         main_menu(chat_id)
         return
 
-    # ── مصروف ─────────────────────────────────────────────
+    # مصروف
     if data == "menu_expense":
         sessions[chat_id] = {"step": "expense_desc"}
         send(chat_id, "اكتب وصف المصروف:")
         return
 
-    # ── إلغاء بيع ─────────────────────────────────────────
+    # إلغاء بيع
     if data == "cancel_sale":
         sessions[chat_id] = {"step": "cancel_sale_id"}
         send(chat_id, "اكتب رقم عملية البيع للإلغاء:")
         return
 
-    # ── مرتجع ─────────────────────────────────────────────
+    # مرتجع
     if data == "return_sale":
         sessions[chat_id] = {"step": "return_customer"}
         send(chat_id, "اكتب اسم العميل:")
@@ -329,35 +374,37 @@ def handle_callback(chat_id, data, callback_id):
         send(chat_id, f"كم قطعة مرتجع من {product}؟")
         return
 
-    # ── التقارير ──────────────────────────────────────────
-    if data.startswith("report_") or data.startswith("profit_") or data in ["top_product", "top_customer"]:
-        handle_report(chat_id, data, inventory, sales_ws, exp_ws)
-        return
-
-def handle_report(chat_id, data, inventory, sales_ws, exp_ws):
+    # التقارير
     today = datetime.now().strftime("%Y-%m-%d")
     month = datetime.now().strftime("%Y-%m")
 
-    if "today" in data: period, label = today, "اليوم"
-    elif "week" in data: period, label = today[:8], "هذا الأسبوع"
-    elif "month" in data: period, label = month, "هذا الشهر"
-    else: period, label = "", "الكل"
-
-    all_sales = sales_ws.get_all_values()
-    filtered = [r for r in all_sales[1:] if len(r) >= 5 and (not period or r[1].startswith(period)) and not str(r[4]).startswith("-")]
+    if data in ["report_today", "profit_today"]:
+        period, label = today, "اليوم"
+    elif data in ["report_month", "profit_month"]:
+        period, label = month, "هذا الشهر"
+    else:
+        period, label = "", "الكل"
 
     if "profit" in data:
-        rev = sum(inventory.get(find_product(inventory, r[3]) or "", {}).get("price", 0) * int(r[4]) for r in filtered if r[4].isdigit())
-        all_exp = exp_ws.get_all_values()
-        exp_total = sum(float(r[2]) for r in all_exp[1:] if len(r) >= 3 and (not period or r[0].startswith(period)) and r[2])
-        send(chat_id, f"الأرباح ({label}):\n\nالمبيعات: {rev:.0f} درهم\nالمصاريف: {exp_total:.0f} درهم\nصافي الربح: {rev - exp_total:.0f} درهم",
-             [[{"text": "🔙 رجوع", "callback_data": "menu_reports"}]])
+        rev, cogs, exp, gross, net, count = calc_profit(inventory, sales_ws, exp_ws, period)
+        send(chat_id,
+            f"الأرباح ({label}):\n\n"
+            f"إجمالي المبيعات: {rev:.0f} درهم\n"
+            f"تكلفة البضاعة: {cogs:.0f} درهم\n"
+            f"المصاريف: {exp:.0f} درهم\n"
+            f"{'─'*20}\n"
+            f"إجمالي الربح: {gross:.0f} درهم\n"
+            f"صافي الربح: {net:.0f} درهم",
+            [[{"text": "🔙 رجوع", "callback_data": "menu_reports"}]])
         return
 
     if data == "top_product":
+        all_sales = sales_ws.get_all_values()
+        filtered = [r for r in all_sales[1:] if len(r) >= 5 and not str(r[4]).startswith("-")]
         counts = {}
         for r in filtered:
-            counts[r[3]] = counts.get(r[3], 0) + int(r[4])
+            try: counts[r[3]] = counts.get(r[3], 0) + int(r[4])
+            except: pass
         if not counts:
             send(chat_id, "مفيش مبيعات", [[{"text": "🔙 رجوع", "callback_data": "menu_reports"}]])
             return
@@ -368,6 +415,8 @@ def handle_report(chat_id, data, inventory, sales_ws, exp_ws):
         return
 
     if data == "top_customer":
+        all_sales = sales_ws.get_all_values()
+        filtered = [r for r in all_sales[1:] if len(r) >= 5 and not str(r[4]).startswith("-")]
         counts = {}
         for r in filtered:
             counts[r[2]] = counts.get(r[2], 0) + 1
@@ -380,11 +429,17 @@ def handle_report(chat_id, data, inventory, sales_ws, exp_ws):
         send(chat_id, msg, [[{"text": "🔙 رجوع", "callback_data": "menu_reports"}]])
         return
 
-    total = sum(int(r[4]) for r in filtered if r[4].isdigit())
-    rev = sum(inventory.get(find_product(inventory, r[3]) or "", {}).get("price", 0) * int(r[4]) for r in filtered if r[4].isdigit())
-    send(chat_id,
-        f"تقرير {label}:\n\nعدد العمليات: {len(filtered)}\nإجمالي القطع: {total}\nإجمالي المبيعات: {rev:.0f} درهم",
-        [[{"text": "🔙 رجوع", "callback_data": "menu_reports"}]])
+    if data.startswith("report_"):
+        rev, cogs, exp, gross, net, count = calc_profit(inventory, sales_ws, exp_ws, period)
+        send(chat_id,
+            f"تقرير {label}:\n\n"
+            f"عدد العمليات: {count}\n"
+            f"إجمالي المبيعات: {rev:.0f} درهم\n"
+            f"تكلفة البضاعة: {cogs:.0f} درهم\n"
+            f"المصاريف: {exp:.0f} درهم\n"
+            f"صافي الربح: {net:.0f} درهم",
+            [[{"text": "🔙 رجوع", "callback_data": "menu_reports"}]])
+        return
 
 # ── معالجة الرسائل النصية ─────────────────────────────────
 def handle_message(chat_id, text):
@@ -399,33 +454,35 @@ def handle_message(chat_id, text):
         send(chat_id, f"خطأ: {e}")
         return
 
-    # ── خطوات الفاتورة ────────────────────────────────────
+    # فاتورة - اسم العميل
     if step == "invoice_customer":
-        sessions[chat_id] = {"step": "invoice_product", "customer": text, "items": []}
-        keyboard = products_keyboard(inventory, "invoice_add")
+        sessions[chat_id]["customer"] = text
+        sessions[chat_id]["step"] = "invoice_product"
+        keyboard = products_keyboard(chat_id, "invoice_add")
         send(chat_id, f"اختار المنتج للعميل {text}:", keyboard)
         return
 
+    # فاتورة - الكمية
     if step == "invoice_qty":
         try:
             qty = int(text)
             product = sess["current_product"]
             if inventory.get(product, {}).get("qty", 0) < qty:
-                send(chat_id, f"المخزون مش كافي! متبقي {inventory[product]['qty']} بس")
+                send(chat_id, f"المخزون مش كافي! متبقي {inventory.get(product,{}).get('qty',0)} بس")
                 return
             sess["items"].append({"product": product, "qty": qty})
             sess["step"] = "invoice_product"
+            items_text = "\n".join([f"- {i['product']} × {i['qty']}" for i in sess["items"]])
             keyboard = [
                 [{"text": "✅ إنهاء الفاتورة", "callback_data": "invoice_done"}],
                 [{"text": "➕ إضافة منتج آخر", "callback_data": "invoice_add_more"}]
             ]
-            items_text = "\n".join([f"- {i['product']} × {i['qty']}" for i in sess["items"]])
-            send(chat_id, f"المنتجات حتى الآن:\n{items_text}", keyboard)
+            send(chat_id, f"المنتجات:\n{items_text}", keyboard)
         except:
-            send(chat_id, "اكتب رقم صحيح للكمية")
+            send(chat_id, "اكتب رقم صحيح")
         return
 
-    # ── خطوات إضافة كمية ─────────────────────────────────
+    # إضافة كمية
     if step == "add_stock_qty":
         try:
             qty = int(text)
@@ -443,35 +500,46 @@ def handle_message(chat_id, text):
             send(chat_id, "اكتب رقم صحيح")
         return
 
-    # ── منتج جديد ─────────────────────────────────────────
+    # منتج جديد - الاسم
     if step == "new_product_name":
         sess["product"] = text
         sess["step"] = "new_product_qty"
         send(chat_id, f"كم الكمية الابتدائية لـ {text}؟")
         return
 
+    # منتج جديد - الكمية
     if step == "new_product_qty":
         try:
-            qty = int(text)
-            sess["qty"] = qty
+            sess["qty"] = int(text)
             sess["step"] = "new_product_price"
-            send(chat_id, f"كم سعر {sess['product']}؟ (اكتب 0 لو مش عارف)")
+            send(chat_id, f"كم سعر البيع لـ {sess['product']}؟")
         except:
             send(chat_id, "اكتب رقم صحيح")
         return
 
+    # منتج جديد - سعر البيع
     if step == "new_product_price":
         try:
-            price = float(text)
-            inv_ws.append_row([sess["product"], sess["qty"], price if price else ""])
+            sess["price"] = float(text)
+            sess["step"] = "new_product_cost"
+            send(chat_id, f"كم تكلفة الشراء لـ {sess['product']}؟ (اكتب 0 لو مش عارف)")
+        except:
+            send(chat_id, "اكتب رقم صحيح")
+        return
+
+    # منتج جديد - التكلفة
+    if step == "new_product_cost":
+        try:
+            cost = float(text)
+            inv_ws.append_row([sess["product"], sess["qty"], sess["price"], cost if cost else ""])
             sessions.pop(chat_id, None)
-            send(chat_id, f"تم إضافة {sess['product']}\nالكمية: {sess['qty']}\nالسعر: {price} درهم")
+            send(chat_id, f"تم إضافة {sess['product']}\nالكمية: {sess['qty']}\nسعر البيع: {sess['price']} درهم\nالتكلفة: {cost} درهم")
             main_menu(chat_id)
         except:
             send(chat_id, "اكتب رقم صحيح")
         return
 
-    # ── تعديل سعر ─────────────────────────────────────────
+    # تعديل سعر
     if step == "edit_price_value":
         try:
             price = float(text)
@@ -488,7 +556,24 @@ def handle_message(chat_id, text):
             send(chat_id, "اكتب رقم صحيح")
         return
 
-    # ── تعديل اسم ─────────────────────────────────────────
+    # تعديل تكلفة
+    if step == "edit_cost_value":
+        try:
+            cost = float(text)
+            product = sess["product"]
+            all_rows = inv_ws.get_all_values()
+            for i, row in enumerate(all_rows):
+                if row[0].strip() == product:
+                    inv_ws.update_cell(i + 1, 4, cost)
+                    break
+            sessions.pop(chat_id, None)
+            send(chat_id, f"تم تعديل تكلفة {product} إلى {cost} درهم")
+            main_menu(chat_id)
+        except:
+            send(chat_id, "اكتب رقم صحيح")
+        return
+
+    # تعديل اسم
     if step == "edit_name_value":
         product = sess["product"]
         all_rows = inv_ws.get_all_values()
@@ -501,13 +586,14 @@ def handle_message(chat_id, text):
         main_menu(chat_id)
         return
 
-    # ── مصروف ─────────────────────────────────────────────
+    # مصروف - الوصف
     if step == "expense_desc":
         sess["desc"] = text
         sess["step"] = "expense_amount"
         send(chat_id, "كم المبلغ؟")
         return
 
+    # مصروف - المبلغ
     if step == "expense_amount":
         try:
             amount = float(text)
@@ -520,14 +606,14 @@ def handle_message(chat_id, text):
             send(chat_id, "اكتب رقم صحيح")
         return
 
-    # ── إلغاء بيع ─────────────────────────────────────────
+    # إلغاء بيع
     if step == "cancel_sale_id":
         try:
             sale_id = int(text)
             all_rows = sales_ws.get_all_values()
             for i, row in enumerate(all_rows[1:], start=2):
                 if len(row) >= 5 and str(row[0]) == str(sale_id):
-                    product = row[3]
+                    product  = row[3]
                     qty_back = int(row[4])
                     prod = find_product(inventory, product)
                     if prod:
@@ -546,18 +632,19 @@ def handle_message(chat_id, text):
             send(chat_id, "اكتب رقم صحيح")
         return
 
-    # ── مرتجع ─────────────────────────────────────────────
+    # مرتجع - العميل
     if step == "return_customer":
         sess["customer"] = text
         sess["step"] = "return_product"
-        keyboard = products_keyboard(inventory, "return_prod")
+        keyboard = products_keyboard(chat_id, "return_prod")
         send(chat_id, "اختار المنتج المرتجع:", keyboard)
         return
 
+    # مرتجع - الكمية
     if step == "return_qty":
         try:
             qty = int(text)
-            product = sess["product"]
+            product  = sess["product"]
             customer = sess["customer"]
             all_rows = inv_ws.get_all_values()
             for i, row in enumerate(all_rows):
@@ -574,17 +661,16 @@ def handle_message(chat_id, text):
             send(chat_id, "اكتب رقم صحيح")
         return
 
-    # ── أوامر نصية سريعة ─────────────────────────────────
-    if text in ["مساعدة", "help", "الاوامر"]:
+    # أوامر سريعة
+    if text in ["مساعدة", "help"]:
         send(chat_id, HELP_TEXT)
         return
 
-    if text in ["القائمة", "قائمة", "menu", "ابدأ", "/start"]:
+    if text in ["القائمة", "قائمة", "menu", "/start"]:
         sessions.pop(chat_id, None)
         main_menu(chat_id)
         return
 
-    # باقي كم (نصي سريع)
     if re.search(r"باقي كم|كم باقي", text):
         query = re.sub(r"باقي كم|كم باقي|من", "", text).strip()
         if not query:
@@ -600,7 +686,6 @@ def handle_message(chat_id, text):
                 send(chat_id, f"ما لقيتش '{query}'")
         return
 
-    # رسالة غير معروفة
     sessions.pop(chat_id, None)
     main_menu(chat_id)
 
@@ -612,7 +697,7 @@ HELP_TEXT = """دليل الأوامر السريعة:
 - باقي كم — كل المخزن
 - مساعدة — هذا الدليل
 
-كل العمليات التانية عن طريق الأزرار"""
+كل العمليات الأخرى عن طريق الأزرار"""
 
 # ── HTTP Server ───────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
